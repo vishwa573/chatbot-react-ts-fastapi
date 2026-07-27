@@ -92,6 +92,17 @@ async def get_conversation_messages(conversation_id: uuid.UUID, db: AsyncSession
 
 from fastapi.responses import StreamingResponse
 
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """Deletes a conversation and cascades to delete all its messages."""
+    conv = await db.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    
+    await db.delete(conv)
+    await db.commit()
+    return {"status": "success"}
+
 @app.post("/chat")
 async def chat_endpoint(payload: ChatRequest, db: AsyncSession = Depends(get_db)):
     """
@@ -128,7 +139,20 @@ async def chat_endpoint(payload: ChatRequest, db: AsyncSession = Depends(get_db)
     history_result = await db.execute(stmt)
     history_messages = history_result.scalars().all()
 
-    messages_for_llm = [{"role": msg.role, "content": msg.content} for msg in history_messages]
+    # Define the max number of historical messages to send (e.g., last 10 messages)
+    MAX_HISTORY = 10
+    
+    # Always start with a system prompt to define the AI's behavior
+    messages_for_llm = [
+        {"role": "system", "content": "You are a helpful, concise AI assistant. Format responses using Markdown."}
+    ]
+    
+    # Slice the history to only include the most recent messages
+    recent_history = history_messages[-MAX_HISTORY:] if len(history_messages) > MAX_HISTORY else history_messages
+    
+    # Append the recent history to the system prompt
+    for msg in recent_history:
+        messages_for_llm.append({"role": msg.role, "content": msg.content})
 
     # 4. Generator function for streaming + final DB save
     async def generate():

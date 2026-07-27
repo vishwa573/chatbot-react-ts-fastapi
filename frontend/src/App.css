@@ -47,25 +47,55 @@
   overflow-y: auto;
 }
 
-.conv-item {
+/* Replace the old .conv-item styles with these */
+.conv-item-container {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+  color: #ececf1;
+  transition: background-color 0.2s;
+}
+
+.conv-item-container:hover {
+  background-color: #2a2b32;
+}
+
+.conv-item-container.active {
+  background-color: #343541;
+}
+
+.conv-item-title {
   background: none;
   border: none;
-  color: #ececf1;
+  color: inherit;
   text-align: left;
-  padding: 0.75rem;
-  border-radius: 4px;
+  flex: 1;
   cursor: pointer;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  font-size: 0.9rem;
 }
 
-.conv-item:hover {
-  background-color: #2a2b32;
+.delete-conv-btn {
+  background: none;
+  border: none;
+  color: #888;
+  cursor: pointer;
+  font-size: 1rem;
+  padding: 0 0.5rem;
+  visibility: hidden; /* Hides the X until you hover */
 }
 
-.conv-item.active {
-  background-color: #343541;
+.conv-item-container:hover .delete-conv-btn {
+  visibility: visible;
+}
+
+.delete-conv-btn:hover {
+  color: #ff4a4a;
 }
 
 /* Chat Container Styles */
@@ -157,4 +187,12 @@
 .chat-input-form button:disabled {
   background-color: #ccc;
   cursor: not-allowed;
+}
+
+.chat-input-form .stop-btn {
+  background-color: #dc3545;
+}
+
+.chat-input-form .stop-btn:hover {
+  background-color: #c82333;
 }
