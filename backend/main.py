@@ -12,11 +12,15 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select , delete
 
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct, Filter, FieldCondition, MatchValue
+from pydantic import BaseModel
+
+class RenameRequest(BaseModel):
+    title: str
 
 # --- Initialize RAG Globals ---
 print("Loading Embedding Model...")
@@ -65,6 +69,8 @@ CURRENT_USER_ID = "user_123"
 class ChatRequest(BaseModel):
     conversation_id: Optional[uuid.UUID] = None
     content: str  # The new user prompt
+    message_id: Optional[uuid.UUID] = None        # ID for new messages
+    edit_message_id: Optional[uuid.UUID] = None   # ID if we are editing an old message
 
 class MessageOut(BaseModel):
     id: uuid.UUID
@@ -111,6 +117,16 @@ async def get_conversation_messages(conversation_id: uuid.UUID, db: AsyncSession
     return result.scalars().all()
 
 from fastapi.responses import StreamingResponse
+
+@app.put("/conversations/{conversation_id}")
+async def rename_conversation(conversation_id: uuid.UUID, req: RenameRequest, db: AsyncSession = Depends(get_db)):
+    conv = await db.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    
+    conv.title = req.title
+    await db.commit()
+    return {"status": "success"}
 
 @app.delete("/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
@@ -213,10 +229,33 @@ async def chat_endpoint(payload: ChatRequest, db: AsyncSession = Depends(get_db)
             await db.commit()
             raise HTTPException(status_code=404, detail="Conversation not found")
 
+    if payload.edit_message_id:
+        # EDIT FLOW
+        user_msg = await db.get(DBMessage, payload.edit_message_id)
+        if not user_msg:
+            raise HTTPException(status_code=404, detail="Message not found")
+            
+        user_msg.content = payload.content
+        
+        # Delete all messages in this chat that came AFTER the edited message
+        await db.execute(
+            delete(DBMessage).where(
+                DBMessage.conversation_id == conv_id,
+                DBMessage.created_at > user_msg.created_at
+            )
+        )
+        await db.commit()
     # 2. Save User Message to Postgres
-    user_msg = DBMessage(conversation_id=conv_id, role="user", content=payload.content)
-    db.add(user_msg)
-    await db.commit()
+    else:
+        # NORMAL FLOW
+        user_msg = DBMessage(
+            id=payload.message_id or uuid.uuid4(),
+            conversation_id=conv_id,
+            role="user",
+            content=payload.content
+        )
+        db.add(user_msg)
+        await db.commit()
 
     # 3. Fetch full historical context for Groq
     stmt = (
@@ -259,16 +298,20 @@ async def chat_endpoint(payload: ChatRequest, db: AsyncSession = Depends(get_db)
         search_results = getattr(search_response, 'points', search_response)
         
         if search_results:
-            context_texts = [hit.payload["text"] for hit in search_results]
+            SCORE_THRESHOLD = 0.45
+
+            context_texts = [hit.payload["text"] 
+                             for hit in search_results if hit.score <= SCORE_THRESHOLD]
             
             # 4. Modify the system prompt to enforce RAG boundaries
-            system_prompt += (
-                "\n\nContext information is below.\n"
-                "---------------------\n"
-                f"{'\n'.join(context_texts) if context_texts else ''}\n"
-                "---------------------\n"
-                "Answer the user's question using the context provided above. "
-            )
+            if len(context_texts) > 0:
+                system_prompt += (
+                    "\n\nContext information is below.\n"
+                    "---------------------\n"
+                    f"{'\n'.join(context_texts) if context_texts else ''}\n"
+                    "---------------------\n"
+                    "Answer the user's question using the context provided above. "
+                )
     messages_for_llm = [{"role": "system", "content": system_prompt}]
     
     # Slice the history to only include the most recent messages

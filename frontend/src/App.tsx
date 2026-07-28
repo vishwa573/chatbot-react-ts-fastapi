@@ -3,6 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import './App.css';
 
 interface Message {
+  id: string;
   role: 'user' | 'assistant';
   content: string;
 }
@@ -16,7 +17,7 @@ function App() {
   // Phase 4.5: Dictionary State for Background Generation
   // Key = conversation_id, Value = array of messages
   const [chatsData, setChatsData] = useState<Record<string, Message[]>>({});
-  
+  const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
   const [input, setInput] = useState('');
   const [loadingChats, setLoadingChats] = useState<Record<string, boolean>>({});
   
@@ -48,6 +49,36 @@ function App() {
       console.error("Failed to fetch conversations", error);
     }
   };
+
+  const handleStartEdit = (msg: Message) => {
+    setInput(msg.content);
+    setEditingMsgId(msg.id);
+    // Optional: focus the input box here
+  };
+
+  const handleRenameConversation = async (e: React.MouseEvent, id: string, currentTitle: string) => {
+    e.stopPropagation(); // Don't trigger the chat selection
+    
+    // A quick, native browser prompt is perfect for an MVP
+    const newTitle = prompt("Enter new name for this chat:", currentTitle);
+    
+    if (!newTitle || newTitle.trim() === "" || newTitle === currentTitle) return;
+
+    try {
+      const res = await fetch(`http://localhost:8000/conversations/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: newTitle })
+      });
+      
+      if (res.ok) {
+        fetchConversations(); // Refresh the sidebar
+      }
+    } catch (error) {
+      console.error("Failed to rename conversation", error);
+    }
+  };
+
   const handleDeleteConversation = async (e: React.MouseEvent, id: string) => {
     e.stopPropagation(); // Prevents the click from selecting the chat
     
@@ -173,16 +204,45 @@ function App() {
     abortControllersRef.current[trackingId] = abortController;
 
     const initialConvId = activeConversationId;
+    
+    // Capture the edit state and reset it instantly so the UI returns to normal
+    const currentEditId = editingMsgId;
+    setEditingMsgId(null);
+    
+    // Generate IDs on the client side for optimistic UI
+    const newMessageId = crypto.randomUUID();
+    const newAssistantId = crypto.randomUUID();
 
     if (initialConvId) {
-      setChatsData((prev) => ({
-        ...prev,
-        [initialConvId]: [
-          ...(prev[initialConvId] || []),
-          { role: 'user', content: userText },
-          { role: 'assistant', content: '' }
-        ]
-      }));
+      setChatsData((prev) => {
+        const currentChat = prev[initialConvId] || [];
+        
+        if (currentEditId) {
+          // EDIT FLOW: Find the edited message, slice the array, append the edited text and new AI placeholder
+          const editIndex = currentChat.findIndex(m => m.id === currentEditId);
+          if (editIndex === -1) return prev; // Failsafe
+          
+          const truncated = currentChat.slice(0, editIndex);
+          return {
+            ...prev,
+            [initialConvId]: [
+              ...truncated,
+              { id: currentEditId, role: 'user', content: userText },
+              { id: newAssistantId, role: 'assistant', content: '' }
+            ]
+          };
+        } else {
+          // NORMAL FLOW: Append to the end
+          return {
+            ...prev,
+            [initialConvId]: [
+              ...currentChat,
+              { id: newMessageId, role: 'user', content: userText },
+              { id: newAssistantId, role: 'assistant', content: '' }
+            ]
+          };
+        }
+      });
     }
 
     let streamConvId = initialConvId;
@@ -193,9 +253,11 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           conversation_id: initialConvId,
-          content: userText 
+          content: userText,
+          message_id: currentEditId ? undefined : newMessageId, // Send new ID for normal flow
+          edit_message_id: currentEditId || undefined           // Send edit ID for truncation flow
         }),
-        signal: abortController.signal, // 2. Attach the kill switch
+        signal: abortController.signal, 
       });
 
       if (!response.ok) throw new Error(`Server returned ${response.status}`);
@@ -218,10 +280,10 @@ function App() {
             
             const data = JSON.parse(dataStr);
             
+            // 3. New Chat handling
             if (!streamConvId && data.conversation_id) {
               streamConvId = data.conversation_id;
               
-              // 3. Migrate the kill switch and loading state from "new" to the real UUID
               abortControllersRef.current[streamConvId as string] = abortControllersRef.current["new"];
               delete abortControllersRef.current["new"];
               
@@ -234,8 +296,8 @@ function App() {
               setChatsData((prev) => ({
                 ...prev,
                 [streamConvId as string]: [
-                  { role: 'user', content: userText },
-                  { role: 'assistant', content: data.content }
+                  { id: newMessageId, role: 'user', content: userText },
+                  { id: newAssistantId, role: 'assistant', content: data.content }
                 ]
               }));
               
@@ -247,6 +309,7 @@ function App() {
               continue;
             }
             
+            // 4. Stream token appending (works for both edit and normal flows because the AI placeholder is ALWAYS last)
             if (streamConvId) {
               setChatsData((prev) => {
                 const chatMessages = prev[streamConvId as string] || [];
@@ -271,16 +334,14 @@ function App() {
         console.error('Failed to send message:', error);
       }
     } finally {
-      // 4. Clean up the lock and the kill switch when done
+      // 5. Clean up the lock and the kill switch when done
       const finalId = streamConvId || trackingId;
       setLoadingChats(prev => ({ ...prev, [finalId as string]: false }));
       delete abortControllersRef.current[finalId as string];
     }
   };
-
-  // Derive the messages to show on screen based on what is active
   const activeMessages = activeConversationId ? (chatsData[activeConversationId] || []) : [];
-
+  
   return (
     <div className="app-container">
       <aside className="sidebar">
@@ -300,13 +361,22 @@ function App() {
               <button className="conv-item-title">
                 {conv.title}
               </button>
-              <button 
-                className="delete-conv-btn" 
-                onClick={(e) => handleDeleteConversation(e, conv.id)}
-                title="Delete chat"
-              >
-                ✕
-              </button>
+              <div className="conv-item-actions">
+                <button 
+                  className="edit-conv-btn" 
+                  onClick={(e) => handleRenameConversation(e, conv.id, conv.title)}
+                  title="Rename chat"
+                >
+                  ✎
+                </button>
+                <button 
+                  className="delete-conv-btn" 
+                  onClick={(e) => handleDeleteConversation(e, conv.id)}
+                  title="Delete chat"
+                >
+                  ✕
+                </button>
+              </div>
             </div>
           ))}
         </div>
@@ -322,16 +392,25 @@ function App() {
             <p className="empty-state">Start a conversation!</p>
           ) : (
             activeMessages.map((msg, index) => (
-              <div
-                key={index}
-                className={`message-bubble ${
-                  msg.role === 'user' ? 'user' : 'assistant'
-                }`}
-              >
+            <div
+              key={msg.id || index}
+              className={`message-bubble ${msg.role === 'user' ? 'user' : 'assistant'}`}
+            >
+              <div className="message-header">
                 <strong>{msg.role === 'user' ? 'You' : 'AI'}:</strong>
-                <ReactMarkdown>{msg.content}</ReactMarkdown>
+                {msg.role === 'user' && (
+                  <button 
+                    className="edit-msg-btn" 
+                    onClick={() => handleStartEdit(msg)}
+                    title="Edit message"
+                  >
+                    ✎
+                  </button>
+                )}
               </div>
-            ))
+              <ReactMarkdown>{msg.content}</ReactMarkdown>
+            </div>
+          ))
           )}
           <div ref={messagesEndRef} />
         </div>

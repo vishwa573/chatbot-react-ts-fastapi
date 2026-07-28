@@ -242,3 +242,71 @@
   opacity: 0.6;
   cursor: not-allowed;
 }
+
+.conv-item-actions { display: flex; gap: 4px; }
+
+/* =========================================
+   Sidebar Rename & Delete Actions
+   ========================================= */
+.conv-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.edit-conv-btn {
+  background: none;
+  border: none;
+  color: #888;
+  cursor: pointer;
+  font-size: 1rem;
+  padding: 0 0.25rem;
+  visibility: hidden; /* Hides until hover */
+}
+
+/* Show both edit and delete buttons when hovering over the chat in the sidebar */
+.conv-item-container:hover .edit-conv-btn,
+.conv-item-container:hover .delete-conv-btn {
+  visibility: visible;
+}
+
+.edit-conv-btn:hover {
+  color: #4da3ff; /* A nice blue for the edit action */
+}
+
+
+/* =========================================
+   Message Bubble Edit Button
+   ========================================= */
+.message-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.edit-msg-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 1rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  opacity: 0; /* Invisible until you hover over the message */
+  transition: opacity 0.2s, background-color 0.2s;
+}
+
+/* Show the edit button when hovering over the message bubble */
+.message-bubble:hover .edit-msg-btn {
+  opacity: 1;
+}
+
+/* Styling specifically for the User's message bubble (assuming it has a darker/colored background) */
+.message-bubble.user .edit-msg-btn {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.message-bubble.user .edit-msg-btn:hover {
+  color: white;
+  background-color: rgba(255, 255, 255, 0.2);
+}
