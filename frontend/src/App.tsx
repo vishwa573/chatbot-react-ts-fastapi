@@ -25,6 +25,9 @@ function App() {
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadedFiles, setUploadedFiles] = useState<Record<string, string[]>>({});
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -99,6 +102,58 @@ function App() {
     const trackingId = activeConversationId || "new";
     if (abortControllersRef.current[trackingId]) {
       abortControllersRef.current[trackingId].abort();
+    }
+  };
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
+      alert('Only PDF files are supported for RAG indexing.');
+      return;
+    }
+
+    setIsUploading(true);
+
+    // If starting on a fresh "New Chat", generate a UUID now so the file and future messages share the same ID
+    let currentConvId = activeConversationId;
+    if (!currentConvId) {
+      currentConvId = crypto.randomUUID();
+      setActiveConversationId(currentConvId);
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('conversation_id', currentConvId);
+
+    try {
+      const response = await fetch('http://localhost:8000/upload', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errData = await response.json();
+        throw new Error(errData.detail || 'Failed to upload document');
+      }
+
+      const data = await response.json();
+
+      // Track uploaded filename for UI display
+      setUploadedFiles((prev) => ({
+        ...prev,
+        [currentConvId]: [...(prev[currentConvId] || []), data.filename],
+      }));
+
+      fetchConversations();
+    } catch (error: any) {
+      console.error('File upload error:', error);
+      alert(`Upload failed: ${error.message}`);
+    } finally {
+      setIsUploading(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
     }
   };
 
@@ -281,22 +336,59 @@ function App() {
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Replace your existing form with this */}
+        {/* Document Tags Indicator */}
+        {activeConversationId && uploadedFiles[activeConversationId]?.length > 0 && (
+          <div className="uploaded-docs-bar">
+            <span>Indexed Documents:</span>
+            {uploadedFiles[activeConversationId].map((name, idx) => (
+              <span key={idx} className="doc-chip">
+                📄 {name}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* Hidden File Input */}
+        <input
+          type="file"
+          ref={fileInputRef}
+          accept=".pdf"
+          onChange={handleFileUpload}
+          style={{ display: 'none' }}
+        />
+
         <form className="chat-input-form" onSubmit={handleSendMessage}>
+          <button
+            type="button"
+            className="upload-btn"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isUploading || (loadingChats[activeConversationId || "new"] || false)}
+            title="Upload PDF for RAG"
+          >
+            {isUploading ? '⏳' : '📎'}
+          </button>
+
           <input
             type="text"
-            placeholder="Type your message..."
+            placeholder={
+              isUploading
+                ? "Parsing & vectorizing document..."
+                : "Type a message or ask about your uploaded PDF..."
+            }
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            disabled={loadingChats[activeConversationId || "new"] || false}
+            disabled={isUploading || (loadingChats[activeConversationId || "new"] || false)}
           />
-          
+
           {loadingChats[activeConversationId || "new"] ? (
             <button type="button" className="stop-btn" onClick={handleStopGenerating}>
               Stop
             </button>
           ) : (
-            <button type="submit" disabled={!input.trim()}>
+            <button
+              type="submit"
+              disabled={isUploading || !input.trim() || (loadingChats[activeConversationId || "new"] || false)}
+            >
               Send
             </button>
           )}

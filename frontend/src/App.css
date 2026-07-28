@@ -196,3 +196,49 @@
 .chat-input-form .stop-btn:hover {
   background-color: #c82333;
 }
+
+/* Document Tags Header above Input */
+.uploaded-docs-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  background-color: #f0f4f9;
+  border-top: 1px solid #e0e0e0;
+  font-size: 0.85rem;
+  color: #555;
+  overflow-x: auto;
+}
+
+.doc-chip {
+  background-color: #e1f0ff;
+  color: #0056b3;
+  padding: 0.2rem 0.6rem;
+  border-radius: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+/* Upload Button in Form */
+.upload-btn {
+  background-color: #f0f0f0;
+  color: #333;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  padding: 0.75rem 1rem;
+  font-size: 1.1rem;
+  cursor: pointer;
+  transition: background-color 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.upload-btn:hover:not(:disabled) {
+  background-color: #e2e2e2;
+}
+
+.upload-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
