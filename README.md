@@ -170,10 +170,3 @@ npm run lint
 
 ---
 
-## License
-
-Specify a license for the repo (e.g., MIT) or leave as proprietary until a license is chosen.
-
----
-
-If any feature list needs adjustment (for example, you want the README to include additional frontend features or deployment instructions for a specific environment), provide the details and the README will be updated.
