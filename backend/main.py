@@ -3,13 +3,33 @@ import json
 import uuid
 import asyncio
 from typing import List, Optional
-from fastapi import FastAPI, Depends, HTTPException
+import io
+import uuid
+from pypdf import PdfReader
+from fastapi import FastAPI, Depends, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+
+from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient
+from qdrant_client.models import VectorParams, Distance, PointStruct, Filter, FieldCondition, MatchValue
+
+# --- Initialize RAG Globals ---
+print("Loading Embedding Model...")
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+qdrant = QdrantClient(path="./qdrant_db")
+COLLECTION_NAME = "chat_documents"
+
+if not qdrant.collection_exists(COLLECTION_NAME):
+    qdrant.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+    )
 
 from database import get_db, SessionLocal
 from models import Conversation, Message as DBMessage
@@ -103,6 +123,71 @@ async def delete_conversation(conversation_id: uuid.UUID, db: AsyncSession = Dep
     await db.commit()
     return {"status": "success"}
 
+@app.post("/upload")
+async def upload_document(
+    file: UploadFile = File(...), 
+    conversation_id: uuid.UUID = Form(...),
+    db: AsyncSession = Depends(get_db)
+):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    conv = await db.get(Conversation, conversation_id)
+    if not conv:
+        conv = Conversation(
+            id=conversation_id, 
+            title=f"Doc: {file.filename[:20]}"
+        )
+        db.add(conv)
+        await db.commit()
+
+    # 1. Extract text from PDF
+    pdf_bytes = await file.read()
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    raw_text = ""
+    for page in reader.pages:
+        extracted = page.extract_text()
+        if extracted:
+            raw_text += extracted + "\n"
+            
+    if not raw_text.strip():
+        raise HTTPException(status_code=400, detail="Could not extract text from PDF.")
+
+    # 2. Chunking (Simple word-count window for the prototype)
+    words = raw_text.split()
+    chunk_size = 200 # Approx paragraphs
+    chunks = [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+    
+    # 3. Generate Embeddings
+    embeddings = embedding_model.encode(chunks)
+    
+    # 4. Store in Qdrant with specific metadata
+    document_id = str(uuid.uuid4())
+    points = []
+    
+    for i, (chunk, vector) in enumerate(zip(chunks, embeddings)):
+        points.append(
+            PointStruct(
+                id=str(uuid.uuid4()),
+                vector=vector.tolist(),
+                payload={
+                    "conversation_id": str(conversation_id),
+                    "document_id": document_id,
+                    "filename": file.filename,
+                    "chunk_index": i,
+                    "text": chunk
+                }
+            )
+        )
+    
+    qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+    
+    return {
+        "status": "success", 
+        "filename": file.filename,
+        "chunks_processed": len(chunks), 
+        "document_id": document_id
+    }
+
 @app.post("/chat")
 async def chat_endpoint(payload: ChatRequest, db: AsyncSession = Depends(get_db)):
     """
@@ -123,6 +208,9 @@ async def chat_endpoint(payload: ChatRequest, db: AsyncSession = Depends(get_db)
         # Verify conversation exists
         conv = await db.get(Conversation, conv_id)
         if not conv:
+            conv = Conversation(id=conv_id, title=payload.content[:30]) #for upload 
+            db.add(conv)
+            await db.commit()
             raise HTTPException(status_code=404, detail="Conversation not found")
 
     # 2. Save User Message to Postgres
@@ -141,11 +229,47 @@ async def chat_endpoint(payload: ChatRequest, db: AsyncSession = Depends(get_db)
 
     # Define the max number of historical messages to send (e.g., last 10 messages)
     MAX_HISTORY = 10
+    # Base system prompt
+    system_prompt = "You are a helpful, concise AI assistant. Format responses using Markdown."
     
-    # Always start with a system prompt to define the AI's behavior
-    messages_for_llm = [
-        {"role": "system", "content": "You are a helpful, concise AI assistant. Format responses using Markdown."}
-    ]
+    # --- RAG INJECTION START ---
+    # 1. Check if this conversation has any uploaded documents
+    count_result = qdrant.count(
+        collection_name=COLLECTION_NAME,
+        count_filter=Filter(
+            must=[FieldCondition(key="conversation_id", match=MatchValue(value=str(conv_id)))]
+        )
+    )
+    
+    if count_result.count > 0:
+        # 2. Embed the user's current question
+        query_vector = embedding_model.encode(payload.content).tolist()
+        
+        # 3. Retrieve the top 3 most relevant chunks filtered by this exact chat
+        search_response = qdrant.query_points(
+            collection_name=COLLECTION_NAME,
+            query=query_vector,
+            query_filter=Filter(
+                must=[FieldCondition(key="conversation_id", match=MatchValue(value=str(conv_id)))]
+            ),
+            limit=3
+        )
+        
+        # Safely extract the points (handles both list and QueryResponse object formats)
+        search_results = getattr(search_response, 'points', search_response)
+        
+        if search_results:
+            context_texts = [hit.payload["text"] for hit in search_results]
+            
+            # 4. Modify the system prompt to enforce RAG boundaries
+            system_prompt += (
+                "\n\nContext information is below.\n"
+                "---------------------\n"
+                f"{'\n'.join(context_texts) if context_texts else ''}\n"
+                "---------------------\n"
+                "Answer the user's question using the context provided above. "
+            )
+    messages_for_llm = [{"role": "system", "content": system_prompt}]
     
     # Slice the history to only include the most recent messages
     recent_history = history_messages[-MAX_HISTORY:] if len(history_messages) > MAX_HISTORY else history_messages
