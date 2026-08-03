@@ -213,37 +213,34 @@ function App() {
     const newMessageId = crypto.randomUUID();
     const newAssistantId = crypto.randomUUID();
 
-    if (initialConvId) {
-      setChatsData((prev) => {
-        const currentChat = prev[initialConvId] || [];
-        
-        if (currentEditId) {
-          // EDIT FLOW: Find the edited message, slice the array, append the edited text and new AI placeholder
-          const editIndex = currentChat.findIndex(m => m.id === currentEditId);
-          if (editIndex === -1) return prev; // Failsafe
-          
-          const truncated = currentChat.slice(0, editIndex);
-          return {
-            ...prev,
-            [initialConvId]: [
-              ...truncated,
-              { id: currentEditId, role: 'user', content: userText },
-              { id: newAssistantId, role: 'assistant', content: '' }
-            ]
-          };
-        } else {
-          // NORMAL FLOW: Append to the end
-          return {
-            ...prev,
-            [initialConvId]: [
-              ...currentChat,
-              { id: newMessageId, role: 'user', content: userText },
-              { id: newAssistantId, role: 'assistant', content: '' }
-            ]
-          };
-        }
-      });
+    setChatsData((prev) => {
+    const currentChat = prev[trackingId] || []; // Use 'new' if initialConvId is null
+    
+    if (currentEditId) {
+      const editIndex = currentChat.findIndex(m => m.id === currentEditId);
+      if (editIndex === -1) return prev; 
+      
+      const truncated = currentChat.slice(0, editIndex);
+      return {
+        ...prev,
+        [trackingId]: [
+          ...truncated,
+          { id: currentEditId, role: 'user', content: userText },
+          { id: newAssistantId, role: 'assistant', content: '' }
+        ]
+      };
+    } else {
+      return {
+        ...prev,
+        [trackingId]: [
+          ...currentChat,
+          { id: newMessageId, role: 'user', content: userText },
+          { id: newAssistantId, role: 'assistant', content: '' }
+        ]
+      };
     }
+  });
+    
 
     let streamConvId = initialConvId;
 
@@ -293,18 +290,26 @@ function App() {
                 return newState;
               });
               
-              setChatsData((prev) => ({
-                ...prev,
-                [streamConvId as string]: [
-                  { id: newMessageId, role: 'user', content: userText },
-                  { id: newAssistantId, role: 'assistant', content: data.content }
-                ]
-              }));
+              // Move the optimistic chat from "new" to the real ID and update the chunk
+              setChatsData((prev) => {
+                const pendingChat = prev["new"] || [];
+                const updatedPending = [...pendingChat];
+                
+                // Append the first chunk to the placeholder assistant message
+                if (updatedPending.length > 0) {
+                  const lastIdx = updatedPending.length - 1;
+                  updatedPending[lastIdx] = { 
+                    ...updatedPending[lastIdx], 
+                    content: data.content 
+                  };
+                }
+
+                const newState = { ...prev, [streamConvId as string]: updatedPending };
+                delete newState["new"];
+                return newState;
+              });
               
-              setActiveConversationId((currentId) => 
-                currentId === null ? (streamConvId as string) : currentId
-              );
-              
+              setActiveConversationId(streamConvId as string);
               fetchConversations();
               continue;
             }
@@ -338,10 +343,10 @@ function App() {
       const finalId = streamConvId || trackingId;
       setLoadingChats(prev => ({ ...prev, [finalId as string]: false }));
       delete abortControllersRef.current[finalId as string];
+      fetchConversations();
     }
   };
-  const activeMessages = activeConversationId ? (chatsData[activeConversationId] || []) : [];
-  
+  const activeMessages = activeConversationId ? (chatsData[activeConversationId] || []) : (chatsData["new"] || []);  
   return (
     <div className="app-container">
       <aside className="sidebar">

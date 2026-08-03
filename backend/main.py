@@ -1,3 +1,6 @@
+import litellm
+# litellm._turn_on_debug()
+
 import os
 import json
 import uuid
@@ -19,6 +22,18 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct, Filter, FieldCondition, MatchValue
 from pydantic import BaseModel
 
+from strands import Agent
+from strands.models.litellm import LiteLLMModel 
+
+from tools import WorkspaceTools
+from fastapi.responses import StreamingResponse
+from database import get_db, SessionLocal
+from models import Conversation, Message as DBMessage
+
+load_dotenv()
+
+app = FastAPI(title="Chatbot API", version="1.0.0")
+
 class RenameRequest(BaseModel):
     title: str
 
@@ -35,16 +50,30 @@ if not qdrant.collection_exists(COLLECTION_NAME):
         vectors_config=VectorParams(size=384, distance=Distance.COSINE),
     )
 
-from database import get_db, SessionLocal
-from models import Conversation, Message as DBMessage
 
-load_dotenv()
+# client = AsyncOpenAI(
+#     api_key=os.environ.get("GROQ_API_KEY"),
+#     base_url="https://api.groq.com/openai/v1"
+# )
 
-app = FastAPI(title="Chatbot API", version="1.0.0")
-
-client = AsyncOpenAI(
-    api_key=os.environ.get("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1"
+# --- Initialize Strands Provider for Groq ---
+# We use LiteLLMModel to connect Strands to Groq's OpenAI-compatible API
+model = LiteLLMModel(
+    client_args={
+        "api_key": os.environ["GROQ_API_KEY"],
+    },
+    # model_id="groq/llama-3.1-8b-instant", # Keep this as is
+    model_id="groq/llama-3.3-70b-versatile", # Keep this as is
+    params={
+        "temperature": 0.2, #
+        "custom_llm_provider": "groq" # Force the provider
+    }
+)
+# Instantiate the tools using the secure dependency injection pattern
+workspace_tools = WorkspaceTools(
+    qdrant=qdrant,
+    embedding_model=embedding_model,
+    session_factory=SessionLocal
 )
 
 origins = [
@@ -116,7 +145,6 @@ async def get_conversation_messages(conversation_id: uuid.UUID, db: AsyncSession
     result = await db.execute(stmt)
     return result.scalars().all()
 
-from fastapi.responses import StreamingResponse
 
 @app.put("/conversations/{conversation_id}")
 async def rename_conversation(conversation_id: uuid.UUID, req: RenameRequest, db: AsyncSession = Depends(get_db)):
@@ -151,7 +179,8 @@ async def upload_document(
     if not conv:
         conv = Conversation(
             id=conversation_id, 
-            title=f"Doc: {file.filename[:20]}"
+            title=f"Doc: {file.filename[:20]}",
+            user_id=CURRENT_USER_ID
         )
         db.add(conv)
         await db.commit()
@@ -207,12 +236,11 @@ async def upload_document(
 @app.post("/chat")
 async def chat_endpoint(payload: ChatRequest, db: AsyncSession = Depends(get_db)):
     """
-    Phase 4: Database-backed Chat Endpoint
-    Handles lazy creation, saves messages, streams tokens, and saves assistant reply.
+    Strands Agent Chat Endpoint
     """
     conv_id = payload.conversation_id
 
-    # 1. Lazy creation of conversation if none provided
+    # 1. Lazy creation of conversation
     if not conv_id:
         title_snippet = payload.content[:30] + ("..." if len(payload.content) > 30 else "")
         new_conv = Conversation(user_id=CURRENT_USER_ID, title=title_snippet)
@@ -221,23 +249,16 @@ async def chat_endpoint(payload: ChatRequest, db: AsyncSession = Depends(get_db)
         await db.refresh(new_conv)
         conv_id = new_conv.id
     else:
-        # Verify conversation exists
         conv = await db.get(Conversation, conv_id)
         if not conv:
-            conv = Conversation(id=conv_id, title=payload.content[:30]) #for upload 
-            db.add(conv)
-            await db.commit()
             raise HTTPException(status_code=404, detail="Conversation not found")
 
+    # 2. Handle Message Updates (Edit vs New)
     if payload.edit_message_id:
-        # EDIT FLOW
         user_msg = await db.get(DBMessage, payload.edit_message_id)
         if not user_msg:
             raise HTTPException(status_code=404, detail="Message not found")
-            
         user_msg.content = payload.content
-        
-        # Delete all messages in this chat that came AFTER the edited message
         await db.execute(
             delete(DBMessage).where(
                 DBMessage.conversation_id == conv_id,
@@ -245,9 +266,7 @@ async def chat_endpoint(payload: ChatRequest, db: AsyncSession = Depends(get_db)
             )
         )
         await db.commit()
-    # 2. Save User Message to Postgres
     else:
-        # NORMAL FLOW
         user_msg = DBMessage(
             id=payload.message_id or uuid.uuid4(),
             conversation_id=conv_id,
@@ -257,7 +276,6 @@ async def chat_endpoint(payload: ChatRequest, db: AsyncSession = Depends(get_db)
         db.add(user_msg)
         await db.commit()
 
-    # 3. Fetch full historical context for Groq
     stmt = (
         select(DBMessage)
         .where(DBMessage.conversation_id == conv_id)
@@ -266,86 +284,80 @@ async def chat_endpoint(payload: ChatRequest, db: AsyncSession = Depends(get_db)
     history_result = await db.execute(stmt)
     history_messages = history_result.scalars().all()
 
-    # Define the max number of historical messages to send (e.g., last 10 messages)
-    MAX_HISTORY = 10
-    # Base system prompt
-    system_prompt = "You are a helpful, concise AI assistant. Format responses using Markdown."
-    
-    # --- RAG INJECTION START ---
-    # 1. Check if this conversation has any uploaded documents
-    count_result = qdrant.count(
-        collection_name=COLLECTION_NAME,
-        count_filter=Filter(
-            must=[FieldCondition(key="conversation_id", match=MatchValue(value=str(conv_id)))]
-        )
-    )
-    
-    if count_result.count > 0:
-        # 2. Embed the user's current question
-        query_vector = embedding_model.encode(payload.content).tolist()
-        
-        # 3. Retrieve the top 3 most relevant chunks filtered by this exact chat
-        search_response = qdrant.query_points(
-            collection_name=COLLECTION_NAME,
-            query=query_vector,
-            query_filter=Filter(
-                must=[FieldCondition(key="conversation_id", match=MatchValue(value=str(conv_id)))]
-            ),
-            limit=3
-        )
-        
-        # Safely extract the points (handles both list and QueryResponse object formats)
-        search_results = getattr(search_response, 'points', search_response)
-        
-        if search_results:
-            SCORE_THRESHOLD = 0.45
+    # Format the last 10 messages for the Agent
+    messages_for_agent = [{"role": msg.role, "content": msg.content} for msg in history_messages[-10:]]
 
-            context_texts = [hit.payload["text"] 
-                             for hit in search_results if hit.score <= SCORE_THRESHOLD]
-            
-            # 4. Modify the system prompt to enforce RAG boundaries
-            if len(context_texts) > 0:
-                system_prompt += (
-                    "\n\nContext information is below.\n"
-                    "---------------------\n"
-                    f"{'\n'.join(context_texts) if context_texts else ''}\n"
-                    "---------------------\n"
-                    "Answer the user's question using the context provided above. "
-                )
-    messages_for_llm = [{"role": "system", "content": system_prompt}]
-    
-    # Slice the history to only include the most recent messages
-    recent_history = history_messages[-MAX_HISTORY:] if len(history_messages) > MAX_HISTORY else history_messages
-    
-    # Append the recent history to the system prompt
-    for msg in recent_history:
-        messages_for_llm.append({"role": msg.role, "content": msg.content})
+    # 4. Initialize a FRESH stateless Agent for this specific request
+    # This prevents users from colliding with each other's state
+    request_agent = Agent(
+        model=model,
+        tools=[
+            workspace_tools.list_uploaded_documents, #[cite: 1]
+            workspace_tools.search_documents, #[cite: 1]
+            workspace_tools.summarize_document, #[cite: 1]
+            workspace_tools.search_chat_history, #[cite: 1]
+            workspace_tools.rename_conversation #[cite: 1]
+        ],
+        system_prompt = f"""You are a versatile AI Assistant and Workspace Companion. 
 
-    # 4. Generator function for streaming + final DB save
+        CAPABILITIES:
+        1. General Knowledge & Chat: You can answer general knowledge questions, discuss industry trends (like AI, tech, news), help with coding, and engage in standard conversational Q&A.
+        2. Workspace Management: You have tools to search, list, and summarize uploaded PDF documents, search past chat history, and rename conversations.
+
+        CRITICAL CONTEXT FOR THIS REQUEST:
+        - The current active conversation ID is: `{conv_id}`
+        - Whenever you need to rename this conversation using the `rename_conversation` tool, you MUST use this exact UUID string. Never use placeholder words like "current".
+
+        RULES:
+        1. General Queries: For general knowledge, casual conversation, or external topics (e.g., recent AI trends, coding help, general facts), respond directly using your knowledge WITHOUT using any tools.
+        2. Workspace Queries: ONLY use workspace tools when the user explicitly asks to search, summarize, list, or manage uploaded documents or past chat history.
+        3. Tool Output Rules: When calling a tool, strictly output valid JSON and ensure all Tool IDs are integers.
+        4. Privacy: Never expose internal metadata (like raw UUIDs or database keys) to the user in your final response text.""")
+    # 5. The Streaming Generator
     async def generate():
         full_assistant_response = ""
+        # Get the last 5 messages, excluding the current one we just added
+        past_messages = history_messages[-6:-1] 
+        history_text = "\n".join([f"{m.role.upper()}: {m.content}" for m in past_messages])
+        
+        if history_text.strip():
+            contextual_prompt = f"--- Previous Chat Context ---\n{history_text}\n\n--- Current User Request ---\nUSER: {payload.content}"
+        else:
+            contextual_prompt = payload.content
+        try:
+            # Bug 1 & 3 Fixed: Use stream_async and pass the list of messages directly to prompt
+            async for event in request_agent.stream_async(prompt=contextual_prompt):
+                
+                if "current_tool_use" in event:
+                    print(f"🔧 AGENT USING TOOL: {event['current_tool_use']['name']}")
+                
+                if "data" in event and event["data"]:
+                    chunk = event["data"]
+                    full_assistant_response += chunk
+                    yield f"data: {json.dumps({'conversation_id': str(conv_id), 'content': chunk})}\n\n"
+                    await asyncio.sleep(0.01)
+                    
+        except Exception as e:
+            error_str = str(e)
+            print(f"Agent Error: {error_str}")
 
-        stream = await client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=messages_for_llm,
-            stream=True
-        )
+            # --- NEW: Graceful Rate Limit Handling ---
+            if "RateLimitError" in error_str or "rate_limit_exceeded" in error_str:
+                safe_error_msg = "\n\n⚠️ **Rate limit exceeded.** We hit the 6,000 tokens-per-minute ceiling. Please wait a few seconds and try again."
+            else:
+                safe_error_msg = "\n\n⚠️ **An internal error occurred.** Please try again."
 
-        async for chunk in stream:
-            content = chunk.choices[0].delta.content or ""
-            if content:
-                full_assistant_response += content
-                yield f"data: {json.dumps({'conversation_id': str(conv_id), 'content': content})}\n\n"
-                await asyncio.sleep(0.02)
+            yield f"data: {json.dumps({'conversation_id': str(conv_id), 'content': safe_error_msg})}\n\n"
 
-        # 5. Once streaming ends, save the complete Assistant response to DB
-        async with SessionLocal() as fresh_db:
-            assistant_msg = DBMessage(
-                conversation_id=conv_id,
-                role="assistant",
-                content=full_assistant_response
-            )
-            fresh_db.add(assistant_msg)
-            await fresh_db.commit()
+        # 6. Save Final Response to DB
+        if full_assistant_response:
+            async with SessionLocal() as fresh_db:
+                assistant_msg = DBMessage(
+                    conversation_id=conv_id,
+                    role="assistant",
+                    content=full_assistant_response
+                )
+                fresh_db.add(assistant_msg)
+                await fresh_db.commit()
 
     return StreamingResponse(generate(), media_type="text/event-stream")
